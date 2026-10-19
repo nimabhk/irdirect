@@ -33,52 +33,39 @@ case "$ACTION" in
         GW="${2:-}"
         validate_ifname "$IFNAME"
         validate_ip "$GW"
-        # Ensure default and /1 pair for complete bypass of VPN 0/1 routes
-        route add -ifscope "$IFNAME" default "$GW" >/dev/null 2>&1 || \
-        route add -net default "$GW" -ifscope "$IFNAME" >/dev/null 2>&1 || true
-
-        route add -ifscope "$IFNAME" -net 0.0.0.0/1 "$GW" >/dev/null 2>&1 || \
-        route add -net 0.0.0.0/1 "$GW" -ifscope "$IFNAME" >/dev/null 2>&1 || true
-
-        route add -ifscope "$IFNAME" -net 128.0.0.0/1 "$GW" >/dev/null 2>&1 || \
-        route add -net 128.0.0.0/1 "$GW" -ifscope "$IFNAME" >/dev/null 2>&1 || true
+        # Only ensure that a scoped default route exists for this physical interface.
+        # NEVER add global /1 or host routes, as that interferes with system VPN routing daemons.
+        if ! route -n get -ifscope "$IFNAME" default 2>/dev/null | grep -q "flags:"; then
+            route add -ifscope "$IFNAME" default "$GW" >/dev/null 2>&1 || true
+        fi
         ;;
 
     pf-allow-dns)
-        GW=$(netstat -rn -f inet 2>/dev/null | awk '/default.*en1/ {print $2; exit}')
-        [ -z "$GW" ] && GW="192.168.1.1"
-        for ip in "$@"; do
-            validate_ip "$ip"
-            if amnezia_active; then
+        if amnezia_active; then
+            for ip in "$@"; do
+                validate_ip "$ip"
                 pfctl -a "amn/310.blockDNS" -t dnsaddr -T add "$ip" >/dev/null 2>&1 || true
                 pfctl -a "amn/110.allowNets" -t allownets -T add "$ip" >/dev/null 2>&1 || true
-            fi
-            route add -host "$ip" "$GW" >/dev/null 2>&1 || true
-        done
+            done
+        fi
         ;;
 
     pf-allow-ips)
-        GW=$(netstat -rn -f inet 2>/dev/null | awk '/default.*en1/ {print $2; exit}')
-        [ -z "$GW" ] && GW="192.168.1.1"
-        for ip in "$@"; do
-            validate_ip "$ip"
-            if amnezia_active; then
+        if amnezia_active; then
+            for ip in "$@"; do
+                validate_ip "$ip"
                 pfctl -a "amn/110.allowNets" -t allownets -T add "$ip" >/dev/null 2>&1 || true
-            fi
-            route add -host "$ip" "$GW" >/dev/null 2>&1 || true
-        done
+            done
+        fi
         ;;
 
     pf-revoke-ips)
-        GW=$(netstat -rn -f inet 2>/dev/null | awk '/default.*en1/ {print $2; exit}')
-        [ -z "$GW" ] && GW="192.168.1.1"
-        for ip in "$@"; do
-            validate_ip "$ip"
-            if amnezia_active; then
+        if amnezia_active; then
+            for ip in "$@"; do
+                validate_ip "$ip"
                 pfctl -a "amn/110.allowNets" -t allownets -T delete "$ip" >/dev/null 2>&1 || true
-            fi
-            route delete -host "$ip" "$GW" >/dev/null 2>&1 || true
-        done
+            done
+        fi
         ;;
 
     status)
