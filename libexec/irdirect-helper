@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# /usr/local/libexec/irdirect-helper
+# Privileged network and PF helper for irdirect
+# Must be owned by root:wheel with mode 0755
+
+set -euo pipefail
+
+ACTION="${1:-}"
+shift || true
+
+validate_ifname() {
+    if [[ ! "$1" =~ ^en[0-9]+$ ]]; then
+        echo "Invalid interface name: $1" >&2
+        exit 2
+    fi
+}
+
+validate_ip() {
+    if [[ ! "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]]; then
+        echo "Invalid IPv4/CIDR: $1" >&2
+        exit 2
+    fi
+}
+
+amnezia_active() {
+    pfctl -s Anchors 2>/dev/null | grep -q "amn" || \
+    pfctl -a "amn/110.allowNets" -t allownets -T show >/dev/null 2>&1
+}
+
+case "$ACTION" in
+    ensure-route)
+        IFNAME="${1:-}"
+        GW="${2:-}"
+        validate_ifname "$IFNAME"
+        validate_ip "$GW"
+        # Ensure default and /1 pair for complete bypass of VPN 0/1 routes
+        route add -ifscope "$IFNAME" default "$GW" >/dev/null 2>&1 || \
+        route add -net default "$GW" -ifscope "$IFNAME" >/dev/null 2>&1 || true
+
+        route add -ifscope "$IFNAME" -net 0.0.0.0/1 "$GW" >/dev/null 2>&1 || \
+        route add -net 0.0.0.0/1 "$GW" -ifscope "$IFNAME" >/dev/null 2>&1 || true
+
+        route add -ifscope "$IFNAME" -net 128.0.0.0/1 "$GW" >/dev/null 2>&1 || \
+        route add -net 128.0.0.0/1 "$GW" -ifscope "$IFNAME" >/dev/null 2>&1 || true
+        ;;
+
+    pf-allow-dns)
+        GW=$(netstat -rn -f inet 2>/dev/null | awk '/default.*en1/ {print $2; exit}')
+        [ -z "$GW" ] && GW="192.168.1.1"
+        for ip in "$@"; do
+            validate_ip "$ip"
+            if amnezia_active; then
+                pfctl -a "amn/310.blockDNS" -t dnsaddr -T add "$ip" >/dev/null 2>&1 || true
+                pfctl -a "amn/110.allowNets" -t allownets -T add "$ip" >/dev/null 2>&1 || true
+            fi
+            route add -host "$ip" "$GW" >/dev/null 2>&1 || true
+        done
+        ;;
+
+    pf-allow-ips)
+        GW=$(netstat -rn -f inet 2>/dev/null | awk '/default.*en1/ {print $2; exit}')
+        [ -z "$GW" ] && GW="192.168.1.1"
+        for ip in "$@"; do
+            validate_ip "$ip"
+            if amnezia_active; then
+                pfctl -a "amn/110.allowNets" -t allownets -T add "$ip" >/dev/null 2>&1 || true
+            fi
+            route add -host "$ip" "$GW" >/dev/null 2>&1 || true
+        done
+        ;;
+
+    pf-revoke-ips)
+        GW=$(netstat -rn -f inet 2>/dev/null | awk '/default.*en1/ {print $2; exit}')
+        [ -z "$GW" ] && GW="192.168.1.1"
+        for ip in "$@"; do
+            validate_ip "$ip"
+            if amnezia_active; then
+                pfctl -a "amn/110.allowNets" -t allownets -T delete "$ip" >/dev/null 2>&1 || true
+            fi
+            route delete -host "$ip" "$GW" >/dev/null 2>&1 || true
+        done
+        ;;
+
+    status)
+        echo "=== irdirect-helper status ==="
+        echo "pfctl_anchors: $(pfctl -s Anchors 2>/dev/null | tr '\n' ' ')"
+        echo "amnezia_active: $(amnezia_active && echo 'yes' || echo 'no')"
+        if amnezia_active; then
+            echo "--- amn/310.blockDNS: dnsaddr ---"
+            pfctl -a "amn/310.blockDNS" -t dnsaddr -T show 2>/dev/null || true
+            echo "--- amn/110.allowNets: allownets ---"
+            pfctl -a "amn/110.allowNets" -t allownets -T show 2>/dev/null || true
+        fi
+        ;;
+
+    *)
+        echo "Usage: $0 {ensure-route|pf-allow-dns|pf-allow-ips|pf-revoke-ips|status} [args...]" >&2
+        exit 1
+        ;;
+esac

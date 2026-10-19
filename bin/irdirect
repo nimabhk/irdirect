@@ -1,0 +1,1257 @@
+#!/usr/bin/env python3
+"""
+irdirect — macOS Kernel-Scoped VPN Bypass & Direct Iranian ISP Proxy
+Single-port multiplexed proxy (HTTP/HTTPS CONNECT + SOCKS5h) bound to physical WAN
+interface (IP_BOUND_IF = 25) with hard reverse kill-switch (exit 99).
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import ipaddress
+import os
+import random
+import re
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+from typing import Optional, Set, Tuple, List, Dict
+
+# Darwin-specific constant for binding sockets to a specific network interface index
+IP_BOUND_IF = 25
+
+# Exit codes per specification
+EXIT_SUCCESS = 0
+EXIT_KILL_SWITCH = 99
+EXIT_HELPER_ERROR = 98
+EXIT_DNS_ERROR = 97
+
+# State directory for concurrency refcounting & PF state management
+STATE_DIR = "/tmp/irdirect-state"
+
+# Helper binary path
+HELPER_BIN = "/usr/local/libexec/irdirect-helper"
+LOCAL_HELPER_BIN = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "libexec", "irdirect-helper")
+)
+
+# Forbidden subnets guard (prevent leaks to VPN tunnels or internal loops)
+FORBIDDEN_NETWORKS = [
+    ipaddress.ip_network("100.64.0.0/10"),   # VPN CGNAT / utun
+    ipaddress.ip_network("198.18.0.0/15"),   # Fake-IP / Tun Proxy
+    ipaddress.ip_network("127.0.0.0/8"),     # Loopback
+    ipaddress.ip_network("0.0.0.0/8"),       # Local identification
+]
+
+# Iranian & fallback DNS resolvers (MCI / Hamrah-e Aval)
+MCI_RESOLVERS = [
+    "217.218.127.127",
+    "217.218.155.155",
+]
+
+
+def log_verbose(msg: str, verbose: bool = False):
+    if verbose:
+        sys.stderr.write(f"[irdirect] {msg}\n")
+        sys.stderr.flush()
+
+
+def find_helper() -> str:
+    if os.path.exists(HELPER_BIN) and os.access(HELPER_BIN, os.X_OK):
+        return HELPER_BIN
+    if os.path.exists(LOCAL_HELPER_BIN) and os.access(LOCAL_HELPER_BIN, os.X_OK):
+        return LOCAL_HELPER_BIN
+    return HELPER_BIN
+
+
+def run_helper(action: str, *args: str, verbose: bool = False) -> bool:
+    helper = find_helper()
+    cmd = ["sudo", "-n", helper, action] + list(args)
+    try:
+        log_verbose(f"Invoking helper: {' '.join(cmd)}", verbose)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if res.returncode != 0:
+            log_verbose(f"Helper {action} failed: {res.stderr.strip()}", verbose)
+            return False
+        return True
+    except Exception as e:
+        log_verbose(f"Helper invocation exception: {e}", verbose)
+        return False
+
+
+class WANInfo:
+    def __init__(
+        self,
+        ifname: str,
+        ifindex: int,
+        local_ip: str,
+        gateway: str,
+        dns_servers: List[str],
+    ):
+        self.ifname = ifname
+        self.ifindex = ifindex
+        self.local_ip = local_ip
+        self.gateway = gateway
+        self.dns_servers = dns_servers
+
+    def __repr__(self):
+        return (
+            f"WANInfo(ifname={self.ifname}, ifindex={self.ifindex}, "
+            f"local_ip={self.local_ip}, gateway={self.gateway}, dns={self.dns_servers})"
+        )
+
+
+def discover_wan(forced_ifname: Optional[str] = None, verbose: bool = False) -> WANInfo:
+    """
+    Module 1: Physical WAN & Modem DHCP Discovery
+    Deterministic candidate selection ignoring offline/local NAS interfaces.
+    """
+    candidates: List[Tuple[str, str, str]] = []
+
+    if forced_ifname:
+        devices = [forced_ifname]
+    else:
+        devices = []
+        try:
+            out = subprocess.check_output(
+                ["networksetup", "-listallhardwareports"], text=True
+            )
+            devices = re.findall(r"Device:\s*([a-z0-9]+)", out)
+        except Exception as e:
+            log_verbose(f"networksetup discovery failed: {e}", verbose)
+
+        # Fallback to ifconfig active en* interfaces if networksetup empty
+        if not devices:
+            try:
+                out = subprocess.check_output(["ifconfig", "-l"], text=True)
+                devices = [d for d in out.split() if d.startswith("en")]
+            except Exception:
+                devices = ["en1", "en0"]
+
+    for dev in devices:
+        if not dev.startswith("en"):
+            continue
+        try:
+            ip = subprocess.check_output(
+                ["ipconfig", "getifaddr", dev], text=True, stderr=subprocess.DEVNULL
+            ).strip()
+        except Exception:
+            ip = ""
+
+        try:
+            router = subprocess.check_output(
+                ["ipconfig", "getoption", dev, "router"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            router = ""
+
+        if not ip or not router:
+            continue
+
+        # Ignore local NAS / offline interfaces (specifically 192.168.99.0/24 on en0)
+        if ip.startswith("192.168.99."):
+            log_verbose(f"Ignoring local NAS interface {dev} ({ip})", verbose)
+            continue
+
+        candidates.append((dev, ip, router))
+
+    if not candidates:
+        # Fallback: check routing table for default gateway on en*
+        try:
+            netstat_out = subprocess.check_output(
+                ["netstat", "-rn", "-f", "inet"], text=True
+            )
+            for line in netstat_out.splitlines():
+                parts = line.split()
+                if len(parts) >= 6 and parts[0] == "default" and parts[5].startswith("en"):
+                    dev = parts[5]
+                    gw = parts[1]
+                    try:
+                        ip = subprocess.check_output(
+                            ["ipconfig", "getifaddr", dev], text=True, stderr=subprocess.DEVNULL
+                        ).strip()
+                        if ip and not ip.startswith("192.168.99."):
+                            candidates.append((dev, ip, gw))
+                            break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    if not candidates:
+        log_verbose("No valid physical WAN interface discovered!", verbose)
+        sys.exit(EXIT_KILL_SWITCH)
+
+    chosen_if, local_ip, gateway = candidates[0]
+
+    try:
+        ifindex = socket.if_nametoindex(chosen_if)
+    except OSError as e:
+        log_verbose(f"Failed to get ifindex for {chosen_if}: {e}", verbose)
+        sys.exit(EXIT_KILL_SWITCH)
+
+    # DNS Discovery: Gateway -> DHCP domain_name_server -> MCI resolvers
+    dns_list = [gateway]
+    try:
+        dhcp_dns_out = subprocess.check_output(
+            ["ipconfig", "getoption", chosen_if, "domain_name_server"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        for d in dhcp_dns_out.replace(",", " ").split():
+            if d and d not in dns_list:
+                dns_list.append(d)
+    except Exception:
+        pass
+
+    for r in MCI_RESOLVERS:
+        if r not in dns_list:
+            dns_list.append(r)
+
+    info = WANInfo(
+        ifname=chosen_if,
+        ifindex=ifindex,
+        local_ip=local_ip,
+        gateway=gateway,
+        dns_servers=dns_list,
+    )
+    log_verbose(f"Discovered WAN: {info}", verbose)
+    return info
+
+
+def is_ip_forbidden(ip_str: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        if addr.version != 4:
+            return True
+        for net in FORBIDDEN_NETWORKS:
+            if addr in net:
+                return True
+        return False
+    except ValueError:
+        return True
+
+
+def create_bound_socket(ifindex: int, sock_type=socket.SOCK_STREAM) -> socket.socket:
+    """
+    Module 5: Hard Reverse Kill-Switch
+    Creates an AF_INET socket strictly bound to ifindex using IP_BOUND_IF = 25.
+    Aborts immediately with code 99 if kernel binding fails.
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, sock_type)
+        sock.setsockopt(socket.IPPROTO_IP, IP_BOUND_IF, struct.pack("I", ifindex))
+        sock.setblocking(False)
+        return sock
+    except OSError as e:
+        sys.stderr.write(
+            f"[irdirect] CRITICAL REVERSE KILL-SWITCH: Failed to bind socket to ifindex {ifindex}: {e}\n"
+        )
+        sys.stderr.flush()
+        sys.exit(EXIT_KILL_SWITCH)
+
+
+# RFC 1035 Raw DNS Wire Format Resolver
+class DirectDNSResolver:
+    def __init__(self, wan: WANInfo, verbose: bool = False):
+        self.wan = wan
+        self.verbose = verbose
+        self.cache: Dict[str, str] = {}
+        self.whitelisted_ips: Set[str] = set()
+
+    def build_query(self, domain: str) -> Tuple[int, bytes]:
+        xid = random.randint(1, 65535)
+        flags = 0x0100  # Standard query with recursion desired (RD=1)
+        header = struct.pack("!HHHHHH", xid, flags, 1, 0, 0, 0)
+
+        qname = b""
+        for part in domain.strip(".").split("."):
+            bpart = part.encode("ascii")
+            qname += bytes([len(bpart)]) + bpart
+        qname += b"\x00"
+
+        question = qname + struct.pack("!HH", 1, 1)  # QTYPE=1 (A), QCLASS=1 (IN)
+        return xid, header + question
+
+    def parse_name(self, data: bytes, offset: int) -> Tuple[str, int]:
+        labels = []
+        curr = offset
+        jumped = False
+        next_offset = offset
+
+        while curr < len(data):
+            b = data[curr]
+            if b == 0:
+                if not jumped:
+                    next_offset = curr + 1
+                break
+            elif (b & 0xC0) == 0xC0:
+                if not jumped:
+                    next_offset = curr + 2
+                    jumped = True
+                pointer = ((b & 0x3F) << 8) | data[curr + 1]
+                curr = pointer
+            else:
+                curr += 1
+                labels.append(data[curr : curr + b].decode("latin1", errors="replace"))
+                curr += b
+                if not jumped:
+                    next_offset = curr
+
+        return ".".join(labels), next_offset
+
+    def parse_response(self, data: bytes, expected_xid: int) -> List[str]:
+        if len(data) < 12:
+            return []
+        xid, flags, qdcount, ancount, _, _ = struct.unpack("!HHHHHH", data[:12])
+        if xid != expected_xid:
+            return []
+        rcode = flags & 0x000F
+        if rcode != 0:
+            log_verbose(f"DNS response error RCODE={rcode}", self.verbose)
+            return []
+
+        idx = 12
+        # Skip question section
+        for _ in range(qdcount):
+            _, idx = self.parse_name(data, idx)
+            idx += 4  # QTYPE + QCLASS
+
+        ips = []
+        for _ in range(ancount):
+            if idx >= len(data):
+                break
+            _, idx = self.parse_name(data, idx)
+            if idx + 10 > len(data):
+                break
+            atype, _, _, rdlength = struct.unpack("!HHIH", data[idx : idx + 10])
+            idx += 10
+            if atype == 1 and rdlength == 4:  # A record
+                ip_str = socket.inet_ntoa(data[idx : idx + 4])
+                ips.append(ip_str)
+            idx += rdlength
+        return ips
+
+    async def query_server_udp(self, server: str, query: bytes, xid: int) -> Optional[List[str]]:
+        loop = asyncio.get_running_loop()
+        sock = create_bound_socket(self.wan.ifindex, socket.SOCK_DGRAM)
+        try:
+            await loop.sock_connect(sock, (server, 53))
+            await loop.sock_sendall(sock, query)
+
+            fut = loop.create_future()
+
+            def on_readable():
+                try:
+                    data = sock.recv(512)
+                    if not fut.done():
+                        fut.set_result(data)
+                except Exception as e:
+                    if not fut.done():
+                        fut.set_exception(e)
+
+            loop.add_reader(sock.fileno(), on_readable)
+            try:
+                resp_data = await asyncio.wait_for(fut, timeout=1.5)
+                # Check truncation flag
+                flags = struct.unpack("!H", resp_data[2:4])[0]
+                if flags & 0x0200:  # TC (Truncation) bit set
+                    return await self.query_server_tcp(server, query, xid)
+                return self.parse_response(resp_data, xid)
+            finally:
+                loop.remove_reader(sock.fileno())
+        except Exception as e:
+            log_verbose(f"DNS UDP query to {server} failed: {e}", self.verbose)
+            return None
+        finally:
+            sock.close()
+
+    async def query_server_tcp(self, server: str, query: bytes, xid: int) -> Optional[List[str]]:
+        loop = asyncio.get_running_loop()
+        sock = create_bound_socket(self.wan.ifindex, socket.SOCK_STREAM)
+        try:
+            await asyncio.wait_for(loop.sock_connect(sock, (server, 53)), timeout=2.0)
+            tcp_query = struct.pack("!H", len(query)) + query
+            await loop.sock_sendall(sock, tcp_query)
+
+            # Read 2-byte length
+            len_bytes = await loop.sock_recv(sock, 2)
+            if len(len_bytes) < 2:
+                return None
+            resp_len = struct.unpack("!H", len_bytes)[0]
+            resp_data = b""
+            while len(resp_data) < resp_len:
+                chunk = await loop.sock_recv(sock, resp_len - len(resp_data))
+                if not chunk:
+                    break
+                resp_data += chunk
+            return self.parse_response(resp_data, xid)
+        except Exception as e:
+            log_verbose(f"DNS TCP query to {server} failed: {e}", self.verbose)
+            return None
+        finally:
+            sock.close()
+
+    async def resolve(self, domain: str) -> str:
+        # Check if already an IPv4 address
+        try:
+            ipaddress.IPv4Address(domain)
+            if is_ip_forbidden(domain):
+                raise ValueError(f"Forbidden destination IP: {domain}")
+            self.ensure_whitelisted(domain)
+            return domain
+        except ipaddress.AddressValueError:
+            pass
+
+        if domain in self.cache:
+            return self.cache[domain]
+
+        xid, query = self.build_query(domain)
+
+        for srv in self.wan.dns_servers:
+            log_verbose(f"Querying DNS server {srv} for {domain}...", self.verbose)
+            ips = await self.query_server_udp(srv, query, xid)
+            if not ips:
+                log_verbose(f"UDP failed for {srv}, attempting TCP fallback...", self.verbose)
+                ips = await self.query_server_tcp(srv, query, xid)
+            if ips:
+                for ip in ips:
+                    if not is_ip_forbidden(ip):
+                        self.cache[domain] = ip
+                        self.ensure_whitelisted(ip)
+                        log_verbose(f"Resolved {domain} -> {ip} (via {srv})", self.verbose)
+                        return ip
+
+        # Fallback to system resolver if direct physical link DNS is filtered/blocked by ISP
+        try:
+            log_verbose(f"Direct DNS failed for {domain}, trying system DNS fallback...", self.verbose)
+            addr_info = socket.getaddrinfo(domain, None, family=socket.AF_INET, proto=socket.IPPROTO_TCP)
+            for item in addr_info:
+                ip = item[4][0]
+                if not is_ip_forbidden(ip):
+                    self.cache[domain] = ip
+                    self.ensure_whitelisted(ip)
+                    log_verbose(f"Resolved {domain} -> {ip} (via system DNS fallback)", self.verbose)
+                    return ip
+        except Exception as e:
+            log_verbose(f"System DNS fallback failed for {domain}: {e}", self.verbose)
+
+        raise RuntimeError(f"Direct DNS resolution failed for {domain}")
+
+    def ensure_whitelisted(self, ip: str):
+        if ip not in self.whitelisted_ips:
+            self.whitelisted_ips.add(ip)
+            run_helper("pf-allow-ips", ip, verbose=self.verbose)
+
+
+class ConcurrencyTracker:
+    """
+    Tracks running irdirect instances via /tmp/irdirect-state/
+    Revokes PF target IPs only when the last active instance exits.
+    """
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.state_file = os.path.join(STATE_DIR, f"{pid}.state")
+        self.all_added_ips: Set[str] = set()
+
+    def register(self):
+        try:
+            os.makedirs(STATE_DIR, mode=0o777, exist_ok=True)
+            # Ensure permissions are open for other users/cron
+            try:
+                os.chmod(STATE_DIR, 0o777)
+            except OSError:
+                pass
+            with open(self.state_file, "w") as f:
+                f.write(f"{self.pid}\n{int(time.time())}\n")
+        except Exception as e:
+            log_verbose(f"Concurrency tracker register error: {e}")
+
+    def track_ip(self, ip: str):
+        self.all_added_ips.add(ip)
+
+    def cleanup(self, helper_action_fn):
+        try:
+            if os.path.exists(self.state_file):
+                os.remove(self.state_file)
+        except Exception:
+            pass
+
+        # Check if any other instances are still running
+        other_running = False
+        try:
+            if os.path.exists(STATE_DIR):
+                for fname in os.listdir(STATE_DIR):
+                    if fname.endswith(".state"):
+                        try:
+                            other_pid = int(fname.split(".")[0])
+                            if other_pid != self.pid:
+                                os.kill(other_pid, 0)
+                                other_running = True
+                                break
+                        except (OSError, ValueError):
+                            # Stale state file
+                            try:
+                                os.remove(os.path.join(STATE_DIR, fname))
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+
+        if not other_running and self.all_added_ips:
+            helper_action_fn("pf-revoke-ips", *list(self.all_added_ips))
+
+
+class MultiplexedProxyServer:
+    def __init__(
+        self,
+        wan: WANInfo,
+        resolver: DirectDNSResolver,
+        tracker: ConcurrencyTracker,
+        port: int = 0,
+        idle_timeout: int = 0,
+        verbose: bool = False,
+    ):
+        self.wan = wan
+        self.resolver = resolver
+        self.tracker = tracker
+        self.port = port
+        self.idle_timeout = idle_timeout
+        self.verbose = verbose
+        self.server: Optional[asyncio.Server] = None
+        self.bound_port = 0
+        self.last_activity = time.time()
+        self.active_conns = 0
+
+    async def start(self):
+        self.server = await asyncio.start_server(
+            self.handle_client,
+            "127.0.0.1",
+            self.port,
+            reuse_port=True if hasattr(socket, "SO_REUSEPORT") else False,
+        )
+        for s in self.server.sockets:
+            self.bound_port = s.getsockname()[1]
+            break
+        log_verbose(f"Proxy server running on 127.0.0.1:{self.bound_port}", self.verbose)
+
+    async def handle_client(
+        self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter
+    ):
+        self.active_conns += 1
+        self.last_activity = time.time()
+        try:
+            # Peek first byte to distinguish SOCKS5 (0x05) from HTTP (ASCII)
+            first_byte = await client_reader.read(1)
+            if not first_byte:
+                client_writer.close()
+                return
+
+            if first_byte == b"\x05":
+                await self.handle_socks5(first_byte, client_reader, client_writer)
+            else:
+                await self.handle_http(first_byte, client_reader, client_writer)
+        except Exception as e:
+            log_verbose(f"Error handling client connection: {e}", self.verbose)
+        finally:
+            self.active_conns -= 1
+            self.last_activity = time.time()
+            try:
+                client_writer.close()
+                await client_writer.wait_closed()
+            except Exception:
+                pass
+
+    async def pipe(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ):
+        try:
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+                self.last_activity = time.time()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def handle_socks5(
+        self,
+        first_byte: bytes,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ):
+        # Read NMETHODS
+        nmethods_b = await client_reader.read(1)
+        if not nmethods_b:
+            return
+        nmethods = nmethods_b[0]
+        methods = await client_reader.read(nmethods)
+        if 0x00 not in methods:
+            client_writer.write(b"\x05\xFF")  # No acceptable methods
+            await client_writer.drain()
+            return
+
+        client_writer.write(b"\x05\x00")  # Accept NO AUTH
+        await client_writer.drain()
+
+        # Read Request: VER, CMD, RSV, ATYP
+        req_header = await client_reader.read(4)
+        if len(req_header) < 4:
+            return
+        ver, cmd, _, atyp = req_header
+        if cmd != 1:  # CONNECT
+            client_writer.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")  # Command not supported
+            await client_writer.drain()
+            return
+
+        target_host = ""
+        if atyp == 1:  # IPv4
+            ip_bytes = await client_reader.read(4)
+            target_host = socket.inet_ntoa(ip_bytes)
+        elif atyp == 3:  # Domain
+            domain_len_b = await client_reader.read(1)
+            if not domain_len_b:
+                return
+            domain_len = domain_len_b[0]
+            domain_bytes = await client_reader.read(domain_len)
+            target_host = domain_bytes.decode("latin1")
+        elif atyp == 4:  # IPv6 — strictly prohibited by reverse kill-switch
+            log_verbose("SOCKS5 IPv6 requested — rejected by zero-leak policy", self.verbose)
+            client_writer.write(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")  # Address type not supported
+            await client_writer.drain()
+            return
+        else:
+            client_writer.write(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
+            await client_writer.drain()
+            return
+
+        port_bytes = await client_reader.read(2)
+        if len(port_bytes) < 2:
+            return
+        target_port = struct.unpack("!H", port_bytes)[0]
+
+        # Resolve via isolated DNS engine
+        try:
+            resolved_ip = await self.resolver.resolve(target_host)
+        except Exception as e:
+            log_verbose(f"SOCKS5 DNS resolution failed for {target_host}: {e}", self.verbose)
+            client_writer.write(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")  # Host unreachable
+            await client_writer.drain()
+            return
+
+        if is_ip_forbidden(resolved_ip):
+            log_verbose(f"SOCKS5 target IP {resolved_ip} is forbidden!", self.verbose)
+            client_writer.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")  # Connection not allowed
+            await client_writer.drain()
+            return
+
+        self.tracker.track_ip(resolved_ip)
+
+        # Connect via bound socket
+        loop = asyncio.get_running_loop()
+        out_sock = create_bound_socket(self.wan.ifindex, socket.SOCK_STREAM)
+        try:
+            await asyncio.wait_for(
+                loop.sock_connect(out_sock, (resolved_ip, target_port)), timeout=10.0
+            )
+            bound_ip, bound_port = out_sock.getsockname()[:2]
+            resp = (
+                b"\x05\x00\x00\x01"
+                + socket.inet_aton(bound_ip)
+                + struct.pack("!H", bound_port)
+            )
+            client_writer.write(resp)
+            await client_writer.drain()
+
+            remote_reader, remote_writer = await asyncio.open_connection(sock=out_sock)
+            await asyncio.gather(
+                self.pipe(client_reader, remote_writer),
+                self.pipe(remote_reader, client_writer),
+            )
+        except Exception as e:
+            log_verbose(f"SOCKS5 outbound connection failed to {resolved_ip}:{target_port}: {e}", self.verbose)
+            try:
+                client_writer.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")  # Connection refused
+                await client_writer.drain()
+            except Exception:
+                pass
+            out_sock.close()
+
+    async def handle_http(
+        self,
+        first_byte: bytes,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ):
+        initial_line_bytes = first_byte + await client_reader.readline()
+        try:
+            initial_line = initial_line_bytes.decode("latin1").strip()
+        except Exception:
+            return
+
+        if not initial_line:
+            return
+
+        parts = initial_line.split()
+        if len(parts) < 3:
+            return
+
+        method, uri, protocol = parts[0], parts[1], parts[2]
+
+        if method.upper() == "CONNECT":
+            # HTTPS Tunnel: CONNECT host:port HTTP/1.1
+            host_port = uri
+            if ":" in host_port:
+                host, port_str = host_port.split(":", 1)
+                port = int(port_str)
+            else:
+                host = host_port
+                port = 443
+
+            # Read and discard remaining headers
+            while True:
+                line = await client_reader.readline()
+                if not line or line in (b"\r\n", b"\n"):
+                    break
+
+            try:
+                resolved_ip = await self.resolver.resolve(host)
+            except Exception as e:
+                log_verbose(f"HTTP CONNECT DNS resolution failed for {host}: {e}", self.verbose)
+                client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await client_writer.drain()
+                return
+
+            if is_ip_forbidden(resolved_ip):
+                log_verbose(f"HTTP CONNECT target IP {resolved_ip} is forbidden!", self.verbose)
+                client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                await client_writer.drain()
+                return
+
+            self.tracker.track_ip(resolved_ip)
+
+            loop = asyncio.get_running_loop()
+            out_sock = create_bound_socket(self.wan.ifindex, socket.SOCK_STREAM)
+            try:
+                await asyncio.wait_for(
+                    loop.sock_connect(out_sock, (resolved_ip, port)), timeout=10.0
+                )
+                client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await client_writer.drain()
+
+                remote_reader, remote_writer = await asyncio.open_connection(
+                    sock=out_sock
+                )
+                await asyncio.gather(
+                    self.pipe(client_reader, remote_writer),
+                    self.pipe(remote_reader, client_writer),
+                )
+            except Exception as e:
+                log_verbose(f"HTTP CONNECT outbound connection failed to {resolved_ip}:{port}: {e}", self.verbose)
+                client_writer.write(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
+                await client_writer.drain()
+                out_sock.close()
+
+        else:
+            # Plain HTTP forward proxy
+            # Parse URL (e.g. http://host[:port]/path)
+            target_url = uri
+            host = ""
+            port = 80
+            path = "/"
+
+            if target_url.startswith("http://"):
+                without_proto = target_url[7:]
+                slash_pos = without_proto.find("/")
+                if slash_pos != -1:
+                    host_part = without_proto[:slash_pos]
+                    path = without_proto[slash_pos:]
+                else:
+                    host_part = without_proto
+                    path = "/"
+                if ":" in host_part:
+                    host, p_str = host_part.split(":", 1)
+                    port = int(p_str)
+                else:
+                    host = host_part
+            else:
+                path = target_url
+
+            headers: List[bytes] = []
+            while True:
+                line = await client_reader.readline()
+                if not line or line in (b"\r\n", b"\n"):
+                    break
+                decoded_header = line.decode("latin1").strip()
+                if decoded_header.lower().startswith("proxy-"):
+                    continue
+                if not host and decoded_header.lower().startswith("host:"):
+                    host_val = decoded_header[5:].strip()
+                    if ":" in host_val:
+                        host, p_str = host_val.split(":", 1)
+                        port = int(p_str)
+                    else:
+                        host = host_val
+                headers.append(line)
+
+            if not host:
+                client_writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                await client_writer.drain()
+                return
+
+            try:
+                resolved_ip = await self.resolver.resolve(host)
+            except Exception as e:
+                log_verbose(f"HTTP Proxy DNS resolution failed for {host}: {e}", self.verbose)
+                client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await client_writer.drain()
+                return
+
+            if is_ip_forbidden(resolved_ip):
+                log_verbose(f"HTTP Proxy target IP {resolved_ip} is forbidden!", self.verbose)
+                client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                await client_writer.drain()
+                return
+
+            self.tracker.track_ip(resolved_ip)
+
+            loop = asyncio.get_running_loop()
+            out_sock = create_bound_socket(self.wan.ifindex, socket.SOCK_STREAM)
+            try:
+                await asyncio.wait_for(
+                    loop.sock_connect(out_sock, (resolved_ip, port)), timeout=10.0
+                )
+                remote_reader, remote_writer = await asyncio.open_connection(
+                    sock=out_sock
+                )
+
+                # Send rewritten request line and cleaned headers
+                req_line = f"{method} {path} {protocol}\r\n".encode("latin1")
+                remote_writer.write(req_line)
+                for h in headers:
+                    remote_writer.write(h)
+                remote_writer.write(b"\r\n")
+                await remote_writer.drain()
+
+                await asyncio.gather(
+                    self.pipe(client_reader, remote_writer),
+                    self.pipe(remote_reader, client_writer),
+                )
+            except Exception as e:
+                log_verbose(f"HTTP Proxy connection failed to {resolved_ip}:{port}: {e}", self.verbose)
+                client_writer.write(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
+                await client_writer.drain()
+                out_sock.close()
+
+    async def idle_checker(self):
+        while True:
+            await asyncio.sleep(2)
+            if self.idle_timeout > 0:
+                idle_sec = time.time() - self.last_activity
+                if self.active_conns == 0 and idle_sec >= self.idle_timeout:
+                    log_verbose(f"Idle timeout ({self.idle_timeout}s) reached. Shutting down.", self.verbose)
+                    if self.server:
+                        self.server.close()
+                    break
+
+    async def stop(self):
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+
+
+def check_scoped_route(ifname: str) -> bool:
+    for target in ("1.1.1.1", "default"):
+        res = subprocess.run(
+            ["route", "-n", "get", "-ifscope", ifname, target],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0 and "flags:" in res.stdout:
+            return True
+    return False
+
+
+def verify_preflight(wan: WANInfo, resolver: DirectDNSResolver, verbose: bool = False) -> bool:
+    """
+    Module 5: Pre-Flight Egress Verification
+    Confirms route -n get -ifscope <ifname> is active and performs fast egress test.
+    """
+    log_verbose("Performing pre-flight route & egress verification...", verbose)
+    # Check if scoped route exists
+    if not check_scoped_route(wan.ifname):
+        log_verbose("Scoped default route missing, attempting injection via helper...", verbose)
+        if not run_helper("ensure-route", wan.ifname, wan.gateway, verbose=verbose):
+            log_verbose("CRITICAL: Failed to ensure ifscope route via helper!", verbose)
+            return False
+
+    # Unlock DNS in Amnezia PF
+    run_helper("pf-allow-dns", *wan.dns_servers, verbose=verbose)
+
+    # Fast egress check over bound socket
+    try:
+        sock = create_bound_socket(wan.ifindex, socket.SOCK_STREAM)
+        sock.settimeout(2.5)
+        # Attempt connection to Nokia modem or direct gateway port 53 / 80
+        sock.connect((wan.gateway, 53))
+        sock.close()
+        log_verbose("Gateway reachability check passed.", verbose)
+    except Exception as e:
+        log_verbose(f"Fast gateway check exception (continuing): {e}", verbose)
+
+    return True
+
+
+def run_doctor(forced_if: Optional[str] = None):
+    print("=" * 60)
+    print(" irdirect Diagnostic Suite (--doctor)")
+    print("=" * 60)
+
+    # 1. OS & Architecture
+    os_name = sys.platform
+    arch = os.uname().machine
+    print(f"[1] Host OS: macOS ({os_name}) | Arch: {arch}")
+
+    # 2. WAN Discovery
+    print("\n[2] Discovering Physical WAN & Nokia Modem DHCP...")
+    try:
+        wan = discover_wan(forced_ifname=forced_if, verbose=True)
+        print(f"    Interface   : {wan.ifname} (Index: {wan.ifindex})")
+        print(f"    Local IP    : {wan.local_ip}")
+        print(f"    Gateway     : {wan.gateway}")
+        print(f"    DNS Servers : {', '.join(wan.dns_servers)}")
+    except Exception as e:
+        print(f"[-] WAN Discovery FAILED: {e}")
+        return EXIT_KILL_SWITCH
+
+    # 3. Helper & Sudoers Check
+    print("\n[3] Checking Helper and Sudoers Permissions...")
+    helper_path = find_helper()
+    print(f"    Helper binary: {helper_path}")
+    if not os.path.exists(helper_path):
+        print("[-] Helper binary not found! Please run install.sh.")
+        return EXIT_HELPER_ERROR
+
+    try:
+        res = subprocess.run(
+            ["sudo", "-n", helper_path, "status"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if res.returncode == 0:
+            print("[+] Helper executed with passwordless sudo.")
+            print("    Helper status output:")
+            for line in res.stdout.strip().splitlines():
+                print(f"      {line}")
+        else:
+            print(f"[-] Sudoers check failed (code {res.returncode}): {res.stderr.strip()}")
+            print("    Make sure /etc/sudoers.d/irdirect has permissions 0440 and syntax is valid.")
+            return EXIT_HELPER_ERROR
+    except Exception as e:
+        print(f"[-] Exception invoking helper: {e}")
+        return EXIT_HELPER_ERROR
+
+    # 4. Scoped Route Check
+    print("\n[4] Checking Scoped Default Route...")
+    if check_scoped_route(wan.ifname):
+        print(f"[+] Scoped route active on {wan.ifname}.")
+    else:
+        print(f"[*] Scoped route not yet present. Injecting via helper...")
+        run_helper("ensure-route", wan.ifname, wan.gateway, verbose=True)
+        if check_scoped_route(wan.ifname):
+            print(f"[+] Scoped route successfully created on {wan.ifname}.")
+        else:
+            print(f"[-] Failed to establish scoped route on {wan.ifname}!")
+            return EXIT_KILL_SWITCH
+
+    # 5. Direct DNS Resolution Check
+    print("\n[5] Checking Isolated Direct DNS Engine (RFC 1035)...")
+    resolver = DirectDNSResolver(wan, verbose=True)
+    test_domains = ["varzesh3.com", "bmi.ir"]
+    for domain in test_domains:
+        try:
+            ip = asyncio.run(resolver.resolve(domain))
+            print(f"[+] Successfully resolved {domain} -> {ip} over {wan.ifname}")
+        except Exception as e:
+            print(f"[-] Failed to resolve {domain}: {e}")
+            return EXIT_DNS_ERROR
+
+    # 6. Egress IP Comparison
+    print("\n[6] Comparing System VPN IP vs Direct Iranian ISP IP...")
+    # System VPN IP
+    try:
+        vpn_ip = subprocess.check_output(
+            ["curl", "-4", "-s", "--max-time", "6", "https://api.ipify.org"],
+            text=True,
+        ).strip()
+        print(f"    System Default (VPN) IP: {vpn_ip}")
+    except Exception as e:
+        vpn_ip = "Unknown / Timeout"
+        print(f"    System Default IP check: {e}")
+
+    # Direct bound test using a temporary proxy instance
+    tracker = ConcurrencyTracker(os.getpid())
+    server = MultiplexedProxyServer(wan, resolver, tracker, port=0, verbose=False)
+    
+    async def test_direct_curl():
+        await server.start()
+        env = os.environ.copy()
+        p_url = f"http://127.0.0.1:{server.bound_port}"
+        p_socks = f"socks5h://127.0.0.1:{server.bound_port}"
+        env["HTTP_PROXY"] = p_url
+        env["http_proxy"] = p_url
+        env["HTTPS_PROXY"] = p_url
+        env["https_proxy"] = p_url
+        env["ALL_PROXY"] = p_socks
+        env["all_proxy"] = p_socks
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-4", "-s", "--max-time", "8", "https://api.ipify.org",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, _ = await proc.communicate()
+            out = stdout.decode().strip()
+            if out:
+                return out
+            # If foreign ipify is restricted on domestic ISP, verify via domestic banking endpoint
+            proc_dom = await asyncio.create_subprocess_exec(
+                "curl", "-k", "-4", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "8", "https://bmi.ir",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout_dom, _ = await proc_dom.communicate()
+            code = stdout_dom.decode().strip()
+            if code in ("200", "301", "302", "403"):
+                return f"Direct Domestic Verified (HTTP {code} on bmi.ir)"
+            return ""
+        finally:
+            await server.stop()
+
+    try:
+        direct_ip = asyncio.run(test_direct_curl())
+        print(f"    irdirect Iranian ISP IP: {direct_ip}")
+        if direct_ip and direct_ip != vpn_ip:
+            print("[+] PASS: Dual routing verified! irdirect bypasses VPN cleanly.")
+        else:
+            print("[!] WARNING: direct_ip matches vpn_ip or is empty.")
+    except Exception as e:
+        print(f"[-] Direct egress test failed: {e}")
+
+    print("\n" + "=" * 60)
+    print(" Diagnostic Complete.")
+    print("=" * 60)
+    return EXIT_SUCCESS
+
+
+async def main_async(args: argparse.Namespace, child_cmd: List[str]) -> int:
+    wan = discover_wan(forced_ifname=args.interface, verbose=args.verbose)
+    resolver = DirectDNSResolver(wan, verbose=args.verbose)
+    tracker = ConcurrencyTracker(os.getpid())
+    tracker.register()
+
+    # Pre-flight route and DNS verification unless --no-check is passed
+    if not args.no_check:
+        if not verify_preflight(wan, resolver, verbose=args.verbose):
+            tracker.cleanup(lambda action, *ips: run_helper(action, *ips, verbose=args.verbose))
+            sys.exit(EXIT_KILL_SWITCH)
+
+    proxy = MultiplexedProxyServer(
+        wan,
+        resolver,
+        tracker,
+        port=args.port or 0,
+        idle_timeout=args.idle_timeout or 0,
+        verbose=args.verbose,
+    )
+    await proxy.start()
+
+    port = proxy.bound_port
+    proxy_http = f"http://127.0.0.1:{port}"
+    proxy_socks = f"socks5h://127.0.0.1:{port}"
+
+    if args.listen:
+        # Standalone listen mode
+        print(f"irdirect listening on 127.0.0.1:{port} (Interface: {wan.ifname})")
+        print(f"HTTP/HTTPS Proxy : {proxy_http}")
+        print(f"SOCKS5h Proxy    : {proxy_socks}")
+        sys.stdout.flush()
+
+        # Handle signals
+        stop_event = asyncio.Event()
+
+        def sig_handler():
+            stop_event.set()
+
+        for s in (signal.SIGINT, signal.SIGTERM):
+            try:
+                asyncio.get_running_loop().add_signal_handler(s, sig_handler)
+            except NotImplementedError:
+                pass
+
+        idle_task = asyncio.create_task(proxy.idle_checker())
+        wait_task = asyncio.create_task(stop_event.wait())
+
+        done, pending = await asyncio.wait(
+            [idle_task, wait_task], return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+
+        await proxy.stop()
+        tracker.cleanup(lambda action, *ips: run_helper(action, *ips, verbose=args.verbose))
+        return EXIT_SUCCESS
+
+    # Mode 1: Command Wrapper
+    if not child_cmd:
+        sys.stderr.write("Error: No command specified to execute.\n")
+        await proxy.stop()
+        tracker.cleanup(lambda action, *ips: run_helper(action, *ips, verbose=args.verbose))
+        return 1
+
+    env = os.environ.copy()
+    env["HTTP_PROXY"] = proxy_http
+    env["http_proxy"] = proxy_http
+    env["HTTPS_PROXY"] = proxy_http
+    env["https_proxy"] = proxy_http
+    env["ALL_PROXY"] = proxy_socks
+    env["all_proxy"] = proxy_socks
+    env["IRDIRECT_PROXY_URL"] = proxy_http
+    env["IRDIRECT_SOCKS_URL"] = proxy_socks
+    env["IRDIRECT_PORT"] = str(port)
+    env["IRDIRECT_INTERFACE"] = wan.ifname
+    env["NO_PROXY"] = "localhost,127.0.0.1,192.168.99.0/24"
+    env["no_proxy"] = "localhost,127.0.0.1,192.168.99.0/24"
+
+    log_verbose(f"Executing wrapped command: {' '.join(child_cmd)}", args.verbose)
+    log_verbose(f"Injected environment proxies on port {port}", args.verbose)
+
+    proc = None
+    try:
+        proc = subprocess.Popen(child_cmd, env=env)
+
+        def forward_signal(sig, frame):
+            if proc and proc.poll() is None:
+                proc.send_signal(sig)
+
+        signal.signal(signal.SIGINT, forward_signal)
+        signal.signal(signal.SIGTERM, forward_signal)
+
+        # Poll process termination while allowing asyncio loop to run proxy
+        while proc.poll() is None:
+            await asyncio.sleep(0.05)
+
+        return proc.returncode
+    except Exception as e:
+        sys.stderr.write(f"[irdirect] Failed to execute command: {e}\n")
+        return 1
+    finally:
+        await proxy.stop()
+        tracker.cleanup(lambda action, *ips: run_helper(action, *ips, verbose=args.verbose))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="irdirect — macOS Kernel-Scoped VPN Bypass & Iranian Direct ISP Proxy",
+        add_help=True,
+    )
+    parser.add_argument(
+        "-p",
+        "--port",
+        type=int,
+        default=0,
+        help="Bind proxy to specific port (default: 0 for random free port)",
+    )
+    parser.add_argument(
+        "--interface",
+        type=str,
+        default=None,
+        help="Force specific physical BSD interface (e.g. en1)",
+    )
+    parser.add_argument(
+        "--no-check",
+        action="store_true",
+        help="Skip pre-flight route and DNS verification for ultra-fast startup",
+    )
+    parser.add_argument(
+        "--listen",
+        action="store_true",
+        help="Run proxy in standalone foreground mode without a child command",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=60,
+        help="Shut down standalone listener after SEC seconds of inactivity (default: 60)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Log internal routing, DNS, and PF operations to stderr",
+    )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run comprehensive self-diagnostic test suite",
+    )
+
+    # Separate options from wrapped command
+    argv = sys.argv[1:]
+    child_cmd = []
+
+    if "--" in argv:
+        split_idx = argv.index("--")
+        opts = argv[:split_idx]
+        child_cmd = argv[split_idx + 1 :]
+    else:
+        # Check if first non-option token exists
+        opts = []
+        i = 0
+        while i < len(argv):
+            arg = argv[i]
+            if arg in ("-p", "--port", "--interface", "--idle-timeout"):
+                opts.append(arg)
+                if i + 1 < len(argv):
+                    opts.append(argv[i + 1])
+                    i += 2
+                    continue
+            elif arg in ("--no-check", "--listen", "-v", "--verbose", "--doctor", "-h", "--help"):
+                opts.append(arg)
+                i += 1
+                continue
+            else:
+                # First positional token starts child command
+                child_cmd = argv[i:]
+                break
+            i += 1
+
+    args = parser.parse_args(opts)
+
+    if args.doctor:
+        sys.exit(run_doctor(forced_if=args.interface))
+
+    ret = asyncio.run(main_async(args, child_cmd))
+    sys.exit(ret)
+
+
+if __name__ == "__main__":
+    main()

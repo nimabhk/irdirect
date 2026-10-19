@@ -1,0 +1,3 @@
+# Allow admin users to invoke irdirect-helper without password prompt in cron/agents
+Defaults!/usr/local/libexec/irdirect-helper !requiretty
+%admin ALL=(root) NOPASSWD: /usr/local/libexec/irdirect-helper

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# irdirect-chrome — Launch Google Chrome with direct Iranian ISP routing
+# Bypasses active VPN without disturbing other system traffic.
+
+set -euo pipefail
+
+URL="${1:-https://torob.com}"
+PROFILE_DIR="$HOME/Library/Application Support/Google/Chrome-irdirect"
+mkdir -p "$PROFILE_DIR"
+
+IRDIRECT_BIN="/usr/local/bin/irdirect"
+if [[ ! -x "$IRDIRECT_BIN" && -x "$(dirname "$0")/irdirect" ]]; then
+    IRDIRECT_BIN="$(dirname "$0")/irdirect"
+fi
+
+echo "[*] Launching Google Chrome via irdirect..."
+echo "    Target URL : $URL"
+echo "    Profile Dir: $PROFILE_DIR"
+
+exec "$IRDIRECT_BIN" sh -c 'exec "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    --proxy-server="http://127.0.0.1:$IRDIRECT_PORT" \
+    --user-data-dir="'"$PROFILE_DIR"'" \
+    --no-first-run \
+    "'"$URL"'"'
