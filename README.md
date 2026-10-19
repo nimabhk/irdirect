@@ -58,6 +58,40 @@ irdirect python3 scraper.py
 irdirect -p 59999 --listen --idle-timeout 120
 ```
 
+### 🤖 AI Agent Integration & Self-Installation
+
+If you use AI coding assistants or autonomous agents (such as **ZCode**, **Claude Code**, **Cursor**, **Windsurf**, or **Aider**), you can instruct them to install and adopt this skill.
+
+#### Method A: Prompt to Feed into Any AI Agent
+Copy and paste this prompt to your agent:
+
+```markdown
+# Iranian Domestic Network Routing Skill (irdirect)
+
+This system runs an active foreign VPN (e.g. AmneziaVPN) while also connected to an Iranian physical ISP link (en1 via Nokia 4G/5G modem).
+
+When interacting with any Iranian domestic internet service, banking portal, .ir domain, or domestic API (e.g. Torob, Divar, MCI, BMI):
+1. NEVER suggest or attempt to disconnect or toggle the system VPN.
+2. ALWAYS route traffic through the `irdirect` tool installed at `/usr/local/bin/irdirect`.
+   - Command wrapper: `irdirect <COMMAND> [ARGS...]` (e.g., `irdirect curl -4 -s -I https://torob.com`)
+   - Direct Google Chrome GUI runner: `irdirect-chrome [URL]` (e.g., `irdirect-chrome https://divar.ir`)
+   - Standalone proxy listener: `irdirect -p 59999 --listen --idle-timeout 120`
+3. Read the complete skill reference file located at `/usr/local/share/irdirect/SKILL.md` (or `~/.zcode/skills/irdirect/SKILL.md`).
+4. Install this skill into your agent workspace/skills directory if supported.
+```
+
+#### Method B: One-Liner Skill Installation for Agents
+Agents with terminal access can automatically register the skill into their environment:
+
+```bash
+# For ZCode:
+mkdir -p ~/.zcode/skills/irdirect
+cp /usr/local/share/irdirect/SKILL.md ~/.zcode/skills/irdirect/SKILL.md
+
+# For Claude Code / Cursor / Windsurf:
+# Simply refer to /usr/local/share/irdirect/SKILL.md or append it to your project rules (.cursorrules / CLAUDE.md)
+```
+
 ---
 
 ## فارسی (Persian)
@@ -106,6 +140,40 @@ irdirect python3 domestic_script.py
 
 # حالت شنونده مستقل برای اتصال ابزارهای اتوماسیون (Playwright / Puppeteer):
 irdirect -p 59999 --listen --idle-timeout 120
+```
+
+### 🤖 راهنمای یکپارچه‌سازی و نصب اسکیل برای ایجنت‌های هوش مصنوعی (AI Agents)
+
+اگر از دستیارهای هوش مصنوعی برنامه‌نویسی یا ایجنت‌های خودکار (مانند **ZCode**, **Claude Code**, **Cursor**, **Windsurf**, **Aider**) استفاده می‌کنید، می‌توانید این مهارت را به آن‌ها معرفی کنید تا به صورت خودکار در مواجهه با سرویس‌های ایرانی از این ابزار استفاده کنند.
+
+#### روش اول: پرامپت آماده جهت ارسال به هوش مصنوعی
+کافی است متن زیر را کپی کرده و به چت ایجنت هوش مصنوعی خود بفرستید:
+
+```markdown
+# راهنمای اتصال به اینترنت داخلی ایران (مهارت irdirect)
+
+روی این سیستم یک VPN خارجی فعال است و هم‌زمان اینترنت مودم سیم‌کارتی همراه اول روی کارت شبکه فیزیکی en1 متصل می‌باشد.
+
+در هر زمان که قصد برقراری ارتباط با سایت‌ها، درگاه‌های بانکی، دامنه‌های .ir یا APIهای داخلی ایران (مانند ترب، دیوار، همراه اول، بانک ملی و غیره) را داری:
+۱. به هیچ وجه درخواست یا تلاش برای خاموش کردن یا قطع کردن VPN سیستم نکن.
+۲. همیشه دستورات را از طریق ابزار `irdirect` نصب‌شده در `/usr/local/bin/irdirect` اجرا کن:
+   - اجرای دستورات ترمینال: `irdirect <COMMAND> [ARGS...]` (مثال: `irdirect curl -4 -s -I https://torob.com`)
+   - باز کردن گوگل کروم مستقیم با محیط ایزوله: `irdirect-chrome [URL]` (مثال: `irdirect-chrome https://divar.ir`)
+   - اجرای حالت شنونده پروکسی: `irdirect -p 59999 --listen --idle-timeout 120`
+۳. اسکریپت‌های پایتون یا اتوماسیون Playwright را نیز از طریق `irdirect python3 script.py` اجرا کن (متغیرهای پروکسی به صورت خودکار تزریق می‌شوند).
+۴. برای مطالعه جزئیات کامل و قوانین ایجنت، فایل مستندات را در `/usr/local/share/irdirect/SKILL.md` (یا `~/.zcode/skills/irdirect/SKILL.md`) بخوان و در صورت پشتیبانی، این اسکیل را در محیط خود ثبت کن.
+```
+
+#### روش دوم: دستور تک‌خطی نصب خودکار اسکیل توسط ایجنت
+ایجنت‌هایی که دسترسی به ترمینال دارند می‌توانند اسکیل را مستقیماً در مسیر مهارت‌های خود ثبت کنند:
+
+```bash
+# برای ZCode:
+mkdir -p ~/.zcode/skills/irdirect
+cp /usr/local/share/irdirect/SKILL.md ~/.zcode/skills/irdirect/SKILL.md
+
+# برای Cursor / Claude Code / Windsurf:
+# کافیست مسیر /usr/local/share/irdirect/SKILL.md را به فایل قوانین ایجنت (.cursorrules یا CLAUDE.md) ضمیمه کنید.
 ```
 
 ---
